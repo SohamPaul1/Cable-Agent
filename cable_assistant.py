@@ -1,4 +1,4 @@
-import os, sys, asyncio, base64, argparse, json, signal, threading, queue, logging
+import os, sys, asyncio, base64, argparse, json, signal, threading, queue, logging, wave, time
 from azure.ai.voicelive.models import ServerEventType
 from typing import Union, Optional, TYPE_CHECKING, cast
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +72,8 @@ class AudioProcessor:
         self.rate = 24000
         self.chunk_size = 1024
 
+        self.input_device_index = 0
+
         # Capture and playback state
         self.is_capturing = False
         self.is_playing = False
@@ -89,7 +91,32 @@ class AudioProcessor:
         self.send_thread: Optional[threading.Thread] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None  # Store the event loop
 
+        # --- RECORDING SETUP (Dual Tracks) ---
+        timestamp = int(time.time())
+        self.in_filename = f"conversation_input_{timestamp}.wav"
+        self.out_filename = f"conversation_output_{timestamp}.wav"
+
+        # Open two separate files
+        self.wav_file_in = wave.open(self.in_filename, "wb")
+        self.wav_file_in.setnchannels(1)
+        self.wav_file_in.setsampwidth(self.audio.get_sample_size(self.format))
+        self.wav_file_in.setframerate(self.rate)
+
+        self.wav_file_out = wave.open(self.out_filename, "wb")
+        self.wav_file_out.setnchannels(1)
+        self.wav_file_out.setsampwidth(self.audio.get_sample_size(self.format))
+        self.wav_file_out.setframerate(self.rate)
+
+        # Thread locks to prevent data corruption
+        self.lock_in = threading.Lock()
+        self.lock_out = threading.Lock()
+
         logger.info("AudioProcessor initialized with 24kHz PCM16 mono audio")
+        logger.info(
+            f"AudioProcessor initialized. Input Device: Index {self.input_device_index}"
+        )
+        logger.info(f"Recording User Voice to: {self.in_filename}")
+        logger.info(f"Recording AI Voice to:   {self.out_filename}")
 
     async def start_capture(self):
         """Start capturing audio from microphone."""
@@ -107,6 +134,7 @@ class AudioProcessor:
                 channels=self.channels,
                 rate=self.rate,
                 input=True,
+                input_device_index=self.input_device_index,
                 frames_per_buffer=self.chunk_size,
                 stream_callback=None,
             )
@@ -139,10 +167,15 @@ class AudioProcessor:
                     self.chunk_size, exception_on_overflow=False
                 )
 
-                if audio_data and self.is_capturing:
-                    # Convert to base64 and queue for sending
-                    audio_base64 = base64.b64encode(audio_data).decode("utf-8")
-                    self.audio_send_queue.put(audio_base64)
+                if audio_data:
+                    # Record to file
+                    with self.lock_in:
+                        self.wav_file_in.writeframes(audio_data)
+                    # Send to Azure
+                    if self.is_capturing:
+                        # Convert to base64 and queue for sending
+                        audio_base64 = base64.b64encode(audio_data).decode("utf-8")
+                        self.audio_send_queue.put(audio_base64)
 
             except Exception as e:
                 if self.is_capturing:
@@ -236,6 +269,9 @@ class AudioProcessor:
                 if audio_data and self.output_stream and self.is_playing:
                     self.output_stream.write(audio_data)
 
+                    # 2. Write to Output WAV file
+                    with self.lock_out:
+                        self.wav_file_out.writeframes(audio_data)
             except queue.Empty:
                 continue
             except Exception as e:
@@ -272,10 +308,28 @@ class AudioProcessor:
 
         logger.info("Stopped audio playback")
 
+    async def wait_for_outgoing_audio(self):
+        """Waits for the audio queue to empty before allowing exit."""
+        if not self.is_playing:
+            return
+
+        # Wait while the queue has data
+        while not self.audio_queue.empty():
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(1.0)
+
     async def cleanup(self):
         """Clean up audio resources."""
         await self.stop_capture()
         await self.stop_playback()
+
+        # Close both recording files
+        with self.lock_in:
+            if self.wav_file_in:
+                self.wav_file_in.close()
+        with self.lock_out:
+            if self.wav_file_out:
+                self.wav_file_out.close()
 
         if self.audio:
             self.audio.terminate()
@@ -515,14 +569,10 @@ class BasicVoiceAssistant:
                 print(f"⚙️ Calling Tool: {item.name}...")
 
                 # --- End_call tool---
+                # --- End_call tool---
                 if item.name == "end_call":
-                    print("📞 Anwesha requested to end call. Shutting down...")
+                    print("📞 Aakash requested to end call.")
 
-                    # STOP AUDIO CAPTURE IMMEDIATELY
-                    if self.audio_processor:
-                        await self.audio_processor.stop_capture()
-
-                    # Send dummy success output back to Azure to satisfy protocol
                     output_item = FunctionCallOutputItem(
                         call_id=item.call_id, output="Call ended successfully."
                     )
@@ -534,7 +584,15 @@ class BasicVoiceAssistant:
                     except Exception:
                         pass
 
-                    # Signal main loop to exit
+                    # 2. CRITICAL FIX: Wait for the "Goodbye" audio to finish playing
+                    print("⏳ Waiting for audio to finish...")
+                    if self.audio_processor:
+                        await self.audio_processor.wait_for_outgoing_audio()
+                        await self.audio_processor.stop_capture()
+
+                    print("✅ Audio finished. Shutting down...")
+
+                    # 3. Signal main loop to exit
                     self.should_exit = True
                     return
 
